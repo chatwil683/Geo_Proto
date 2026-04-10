@@ -5,7 +5,7 @@ import uvicorn
 from pyngrok import ngrok
 
 from geo_proto.offboardControl import OffboardControl
-from oled_display import OLEDDisplay
+from geo_proto.QrOut import OLEDDisplay
 
 # ---------- FastAPI App ----------
 app = FastAPI(title="GeoProto Drone API LTE", version="1.0.0")
