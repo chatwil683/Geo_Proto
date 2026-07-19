@@ -1,5 +1,5 @@
 import os
-from fastapi import FastAPI, Depends, HTTPException
+from fastapi import FastAPI, Depends, HTTPException, Request
 from pydantic import BaseModel
 import uvicorn
 from pyngrok import ngrok, conf
@@ -16,6 +16,7 @@ API_KEY = secrets.token_urlsafe(16)
 print(f"[AUTH] Generated API key: {API_KEY}")
 pending_waypoints: list[tuple[float, float, float]] = []
 _app_connected = False
+_session_token: str | None = None
 
 try:
     oled = OLEDDisplay(i2c_port=1, i2c_address=0x3C)
@@ -23,9 +24,11 @@ except Exception as e:
     print(f"[OLED] Hardware not available: {e} — desktop QR only")
     oled = OLEDDisplay.__new__(OLEDDisplay)
 
-def auth(key: str = ""):
+def auth(request: Request, key: str = "", session: str = ""):
     if key != API_KEY:
         raise HTTPException(status_code=401, detail="Unauthorized")
+    if _session_token and session != _session_token:
+        raise HTTPException(status_code=403, detail="Invalid session — call /handshake first")
 
 class GlobalTarget(BaseModel):
     lat: float
@@ -36,11 +39,12 @@ class GlobalTarget(BaseModel):
 def root():
     return {"message": "GeoProto Drone API online ✅"}
 
-@app.get("/binding")
-def get_binding_url():
-    if not binding_url:
-        return {"error": "Binding not ready yet"}
-    return {"url": binding_url}
+@app.post("/handshake")
+def handshake(key: str = Depends(auth)):
+    global _session_token
+    _session_token = secrets.token_urlsafe(8)
+    print(f"[AUTH] Session token generated: {_session_token}")
+    return {"status": "Bound", "session_token": _session_token}
 
 @app.get("/status")
 def get_status(key: str = Depends(auth)):

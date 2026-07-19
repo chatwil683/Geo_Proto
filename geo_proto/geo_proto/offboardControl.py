@@ -388,11 +388,3 @@ class OffboardControl(Node):
             else self.get_logger().error("[SAFETY] Failed to set LAND mode ❌")
         )
 
-    # ------------------------------------------------------------------
-    # Status helpers
-    # ------------------------------------------------------------------
-
-    @property
-    def current_setpoint(self):
-        """Return first target for API status display."""
-        return self.targets[0] if self.targets else (0.0, 0.0, 0.0)
