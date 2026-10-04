@@ -1,12 +1,11 @@
 import time
-
 import rclpy
 from rclpy.node import Node
-from rclpy.qos import qos_profile_sensor_data
+from rclpy.qos import qos_profile_sensor_data, QoSProfile, ReliabilityPolicy, HistoryPolicy
 
 from geometry_msgs.msg import PoseStamped
 from sensor_msgs.msg import NavSatFix, BatteryState
-from mavros_msgs.msg import State, Waypoint, WaypointReached, TerrainReport
+from mavros_msgs.msg import State, Waypoint, WaypointReached, TerrainReport, StatusText
 from mavros_msgs.srv import CommandBool, SetMode, CommandTOL, WaypointPush, WaypointClear
 
 MIN_ALT = 20.0  # minimum altitude in metres above terrain
@@ -19,6 +18,7 @@ class OffboardControl(Node):
 
     def __init__(self):
         super().__init__('offboard_control')
+        
 
         # --- Subscribers ---
         self.local_pose_sub = self.create_subscription(
@@ -39,11 +39,18 @@ class OffboardControl(Node):
             self.state_callback,
             10
         )
+        
+        battery_qos = QoSProfile(
+            reliability=ReliabilityPolicy.BEST_EFFORT,
+            history=HistoryPolicy.KEEP_LAST,
+            depth=10
+        )
+        
         self.battery_sub = self.create_subscription(
             BatteryState,
             '/mavros/battery',
             self.battery_callback,
-            qos_profile_sensor_data
+            battery_qos
         )
         self.wp_reached_sub = self.create_subscription(
             WaypointReached,
@@ -57,6 +64,19 @@ class OffboardControl(Node):
             self.terrain_callback,
             10
         )
+        statustext_qos = QoSProfile(
+            reliability=ReliabilityPolicy.BEST_EFFORT,
+            history=HistoryPolicy.KEEP_LAST,
+            depth=10
+        )
+        
+        self.statustext_sub = self.create_subscription(
+            StatusText,
+            '/mavros/statustext/recv',
+            self.statustext_callback,
+            statustext_qos
+        )
+
 
         # --- Services ---
         self.arm_cli      = self.create_client(CommandBool,   '/mavros/cmd/arming')
@@ -82,19 +102,30 @@ class OffboardControl(Node):
         self.battery_voltage: float | None = None
         self.battery_percentage: float | None = None
         self._total_mission_waypoints = 0
+        self.oled_callback = None
         
         # --- Terrain Report ---
         self.terrain_pending: int = 0  # number of terrain tiles pending download
         self.terrain_loaded: bool = False
 
         # Safety monitor timer — checks every 5 seconds
-        self.safety_timer = self.create_timer(5.0, self.safety_monitor)
+        self.safety_timer = self.create_timer(2.0, self.safety_monitor)
+        
+        #Pre-arm check
+        self.prearm_failed: bool = False
+        self.prearm_message: str = ""
 
         self.get_logger().info("OffboardControl initialised.")
+        
+
 
     # ------------------------------------------------------------------
     # Callbacks
     # ------------------------------------------------------------------
+    
+    def update_oled(self, message: str):
+        if hasattr(self, 'oled_callback') and self.oled_callback:
+            self.oled_callback(message)
 
     def state_callback(self, msg: State):
         self.state = msg
@@ -104,20 +135,26 @@ class OffboardControl(Node):
 
     def global_callback(self, msg: NavSatFix):
         if self.home_lat is None:
-            self.home_lat = msg.latitude
-            self.home_lon = msg.longitude
-            self.home_alt = msg.altitude
-            self.get_logger().info(
-                f"[GLOBAL] Home set: lat={self.home_lat:.7f}, "
-                f"lon={self.home_lon:.7f}, alt={self.home_alt:.1f}"
-            )
+            if msg.latitude != 0.0 and msg.longitude != 0.0:
+                self.home_lat = msg.latitude
+                self.home_lon = msg.longitude
+                self.home_alt = msg.altitude
+                self.get_logger().info(
+                    f"[GLOBAL] Home set: lat={self.home_lat:.7f}, "
+                    f"lon={self.home_lon:.7f}, alt={self.home_alt:.1f}"
+                )
+            
         self.current_lat = msg.latitude
         self.current_lon = msg.longitude
         self.current_alt = msg.altitude
 
     def battery_callback(self, msg: BatteryState):
         self.battery_voltage = msg.voltage
-        self.battery_percentage = msg.percentage * 100
+        if msg.voltage and msg.voltage > 0:
+            pct = (msg.voltage - 19.8) / (25.2 - 19.8) * 100.0
+            self.battery_percentage = max(0.0, min(100.0,pct))
+        else:
+            self.battery_percentage = None
 
     def wp_reached_callback(self, msg: WaypointReached):
         self.get_logger().info(f"[MISSION] Waypoint {msg.wp_seq} reached.")
@@ -127,10 +164,18 @@ class OffboardControl(Node):
     def terrain_callback(self, msg):
         self.terrain_pending = msg.pending
         self.terrain_loaded = msg.pending == 0 and msg.loaded > 0
-        if not self.terrain_loaded:
-            self.get_logger().warn(
-                f"[TERRAIN] Tiles pending: {msg.pending}, loaded: {msg.loaded}"
-            )
+        
+    def statustext_callback(self, msg: StatusText):
+        text = msg.text.lower()
+        if 'prearm' in text or 'pre-arm' in text or 'failsafe' in text or 'glitch' in text:
+            self.prearm_failed = True
+            self.prearm_message = msg.text
+            self.prearm_timestamp = time.time()
+            self.update_oled(f"PreArm: {msg.text}")
+        elif 'ready to arm' in text or 'arm: good' in text:
+            # Clear prearm message
+            self.prearm_failed = False
+            self.prearm_message = ""
 
     # ------------------------------------------------------------------
     # End of mission sequence
@@ -374,6 +419,11 @@ class OffboardControl(Node):
                 #self.emergency_land()
         else:
             self.battery_warning_sent = False
+            
+        if self.prearm_failed and hasattr(self, 'prearm_timestamp'):
+            if time.time() - self.prearm_timestamp > 10:
+                self.prearm_failed = False
+                self.prearm_message = ""
 
     def emergency_land(self):
         """Immediately switch to LAND mode — drops straight down."""
